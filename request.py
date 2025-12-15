@@ -25,7 +25,7 @@ class QdrantRetriever:
         Инициализация ретривера для Qdrant Cloud
         """
         # Получение данных из переменных окружения или параметров
-        cloud_url = cloud_url or os.getenv("QDRANT_CLOUD_URL")
+        cloud_url = cloud_url or os.getenv("QDRANT_URL")
         api_key = api_key or os.getenv("QDRANT_API_KEY")
         
         if not cloud_url or not api_key:
@@ -212,7 +212,7 @@ def simple_search():
     """Простой поиск без использования класса"""
     
     # Получаем параметры из .env
-    cloud_url = os.getenv("QDRANT_CLOUD_URL")
+    cloud_url = os.getenv("QDRANT_URL")
     api_key = os.getenv("QDRANT_API_KEY")
     
     if not cloud_url or not api_key:

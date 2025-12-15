@@ -1,435 +1,470 @@
+"""
+RAG Service v2 - с Query Expansion через LLM
+Улучшенный поиск за счёт переформулирования запросов
+"""
+
 import os
-import sys
-from typing import List, Optional
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
-from openai import OpenAI
+import json
+import logging
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
-class RAGSystem:
-    def __init__(self):
-        """
-        RAG система, которая всегда берет ключи из переменных окружения
-        """
-        # Получаем ключи ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
-        load_dotenv()
-        self.qdrant_url = os.getenv("QDRANT_URL")
-        self.qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        self.openai_api_key = os.getenv("GPT_KEY")
-        self.collection_name = "my_documents"
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchResult:
+    """Результат поиска"""
+    content: str
+    filename: str
+    score: float
+    chapter: str
+    paragraph: str
+    points: List[str]
+    chunk_id: str = ""
+
+
+@dataclass
+class RAGResponse:
+    """Ответ RAG системы"""
+    answer: str
+    sources: List[SearchResult]
+    query: str
+    expanded_queries: List[str] = field(default_factory=list)
+
+
+class RAGServiceV2:
+    """
+    RAG сервис v2 с Query Expansion
+    """
+    
+    def __init__(
+        self,
+        qdrant_url: Optional[str] = None,
+        qdrant_api_key: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        collection_name: str = "my_documents",
+        embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        llm_model: str = "gpt-4o-mini"
+    ):
+        # Qdrant
+        self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL")
+        self.qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
+        self.collection_name = collection_name
         
-        # Проверяем наличие всех обязательных ключей
-        self._validate_environment_variables()
+        # OpenAI
+        self.openai_api_key = openai_api_key or os.getenv("GPT_KEY")
+        self.llm_model = llm_model
         
-        # Инициализация клиентов
         self._init_clients()
         
-    def _validate_environment_variables(self):
-        """Проверка наличия всех необходимых переменных окружения"""
-        missing_vars = []
+        logger.info(f"Загрузка модели эмбеддингов: {embedding_model}")
+        self.embedding_model = SentenceTransformer(embedding_model)
         
-        if not self.qdrant_url:
-            missing_vars.append("QDRANT_URL")
-        if not self.qdrant_api_key:
-            missing_vars.append("QDRANT_API_KEY")
-        if not self.openai_api_key:
-            missing_vars.append("GPT_KEY")
-        
-        if missing_vars:
-            error_msg = f"❌ Отсутствуют переменные окружения: {', '.join(missing_vars)}\n"
-            error_msg += "Установите их командой:\n"
-            error_msg += "  Linux/Mac: export ИМЯ_ПЕРЕМЕННОЙ='значение'\n"
-            error_msg += "  Windows PowerShell: $env:ИМЯ_ПЕРЕМЕННОЙ='значение'\n"
-            error_msg += "  Windows CMD: set ИМЯ_ПЕРЕМЕННОЙ=значение\n"
-            raise EnvironmentError(error_msg)
+        logger.info("RAG сервис v2 инициализирован")
     
     def _init_clients(self):
-        """Инициализация клиентов Qdrant и OpenAI"""
-        try:
-            print(f"🔗 Подключение к Qdrant...")
-            self.qdrant_client = QdrantClient(
-                url=self.qdrant_url,
-                api_key=self.qdrant_api_key,
-                timeout=30
-            )
-            
-            print(f"🤖 Подключение к OpenAI...")
-            self.openai_client = OpenAI(api_key=self.openai_api_key)
-            
-            # Проверяем соединение с Qdrant
-            collections = self.qdrant_client.get_collections()
-            print(f"✓ Подключено к Qdrant. Коллекции: {[c.name for c in collections.collections]}")
-            
-            # Проверяем коллекцию
-            if self.collection_name not in [c.name for c in collections.collections]:
-                print(f"⚠️  Коллекция '{self.collection_name}' не найдена")
-                print("Доступные коллекции:", [c.name for c in collections.collections])
-            
-            print(f"✓ RAG система инициализирована")
-            print(f"✓ Используется коллекция: {self.collection_name}")
-            
-        except Exception as e:
-            print(f"❌ Ошибка инициализации: {e}")
-            raise
-    
-    def _get_embedding(self, text: str, model: str = "text-embedding-3-small") -> List[float]:
-        """
-        Получение эмбеддинга для текста
-        """
-        try:
-            response = self.openai_client.embeddings.create(
-                model=model,
-                input=text
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            print(f"❌ Ошибка при получении эмбеддинга: {e}")
-            raise
-    
-    def search_documents(self, query: str, limit: int = 5) -> List[dict]:
-        """
-        Поиск документов, релевантных запросу
-        """
-        try:
-            # Векторизуем запрос
-            query_embedding = self._get_embedding(query)
-            
-            # Ищем в Qdrant
-            search_results = self.qdrant_client.search(
-                collection_name=self.collection_name,
-                query_vector=query_embedding,
-                limit=limit,
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            # Форматируем результаты
-            documents = []
-            for result in search_results:
-                doc = {
-                    "id": str(result.id),
-                    "score": float(result.score),
-                    "content": result.payload.get("content", ""),
-                    "metadata": {k: v for k, v in result.payload.items() if k != "content"}
-                }
-                documents.append(doc)
-            
-            return documents
-            
-        except Exception as e:
-            print(f"❌ Ошибка при поиске документов: {e}")
-            return []
-    
-    def generate_answer(self, question: str, documents: List[dict]) -> str:
-        """
-        Генерация ответа на основе найденных документов
-        """
-        if not documents:
-            return "Извините, не нашел подходящей информации в документах."
+        """Инициализация клиентов"""
+        if not self.qdrant_url or not self.qdrant_api_key:
+            raise ValueError("Необходимо указать QDRANT_URL и QDRANT_API_KEY")
         
-        # Формируем контекст из документов
-        context_parts = []
-        for i, doc in enumerate(documents, 1):
-            # Берем только начало документа для экономии токенов
-            content_preview = doc['content'][:800] + "..." if len(doc['content']) > 800 else doc['content']
-            context_parts.append(f"[Документ {i}, релевантность: {doc['score']:.3f}]:\n{content_preview}")
+        if not self.openai_api_key:
+            raise ValueError("Необходимо указать OPENAI_API_KEY")
         
-        context = "\n\n".join(context_parts)
+        self.qdrant = QdrantClient(
+            url=self.qdrant_url,
+            api_key=self.qdrant_api_key,
+            timeout=30
+        )
         
-        # Создаем промпт
-        prompt = f"""Ты - AI-ассистент, который отвечает на вопросы на основе предоставленных документов.
+        self.openai = OpenAI(api_key=self.openai_api_key)
+    
+    def expand_query(self, query: str, num_variants: int = 3) -> List[str]:
+        """
+        Расширение запроса через LLM
+        Генерирует варианты запроса для лучшего поиска
+        """
+        logger.info(f"Расширение запроса: '{query}'")
+        
+        prompt = f"""Ты помогаешь улучшить поиск по нормативно-правовым актам Республики Казахстан.
 
-Контекст из документов:
+Пользователь задал вопрос: "{query}"
+
+Сгенерируй {num_variants} альтернативных формулировки этого запроса для поиска в юридических документах.
+
+ПРАВИЛА:
+1. Используй юридическую терминологию НПА РК (порядок, условия, требования, предоставление)
+2. Каждый вариант должен искать информацию под разным углом
+3. Включи ключевые слова которые могут быть в заголовках разделов
+4. Один вариант — разговорный, один — формальный юридический
+
+Верни ТОЛЬКО JSON массив строк, без пояснений:
+["вариант 1", "вариант 2", "вариант 3"]"""
+
+        try:
+            response = self.openai.chat.completions.create(
+                model=self.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Парсим JSON
+            # Убираем возможные markdown блоки
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+            
+            variants = json.loads(result_text)
+            
+            # Добавляем оригинальный запрос в начало
+            all_queries = [query] + variants
+            
+            logger.info(f"Сгенерировано запросов: {len(all_queries)}")
+            for i, q in enumerate(all_queries):
+                logger.info(f"  {i+1}. {q}")
+            
+            return all_queries
+            
+        except Exception as e:
+            logger.warning(f"Ошибка расширения запроса: {e}")
+            # Fallback: возвращаем только оригинальный запрос
+            return [query]
+    
+    def search_single(self, query: str, limit: int = 5, score_threshold: float = 0.3) -> List[SearchResult]:
+        """Поиск по одному запросу"""
+        query_embedding = self.embedding_model.encode(query).tolist()
+        
+        search_result = self.qdrant.query_points(
+            collection_name=self.collection_name,
+            query=query_embedding,
+            limit=limit,
+            score_threshold=score_threshold,
+            with_payload=True
+        )
+        
+        results = []
+        for hit in search_result.points:
+            payload = hit.payload
+            result = SearchResult(
+                content=payload.get('content', ''),
+                filename=payload.get('filename', ''),
+                score=hit.score,
+                chapter=payload.get('chapter', ''),
+                paragraph=payload.get('paragraph', ''),
+                points=payload.get('points', []),
+                chunk_id=str(hit.id)
+            )
+            results.append(result)
+        
+        return results
+    
+    def search_with_expansion(
+        self, 
+        query: str, 
+        limit: int = 5, 
+        score_threshold: float = 0.3,
+        expand: bool = True,
+        num_variants: int = 3
+    ) -> tuple[List[SearchResult], List[str]]:
+        """
+        Поиск с расширением запроса
+        Возвращает объединённые результаты и список использованных запросов
+        """
+        if expand:
+            queries = self.expand_query(query, num_variants)
+        else:
+            queries = [query]
+        
+        # Собираем результаты от всех запросов
+        all_results: Dict[str, SearchResult] = {}  # chunk_id -> result
+        
+        for q in queries:
+            results = self.search_single(q, limit=limit, score_threshold=score_threshold)
+            
+            for result in results:
+                chunk_id = result.chunk_id
+                
+                # Если чанк уже найден — берём лучший score
+                if chunk_id in all_results:
+                    if result.score > all_results[chunk_id].score:
+                        all_results[chunk_id] = result
+                else:
+                    all_results[chunk_id] = result
+        
+        # Сортируем по score
+        sorted_results = sorted(all_results.values(), key=lambda x: x.score, reverse=True)
+        
+        # Ограничиваем количество
+        final_results = sorted_results[:limit]
+        
+        logger.info(f"Найдено уникальных чанков: {len(all_results)}, возвращаем топ-{len(final_results)}")
+        
+        return final_results, queries
+    
+    def _build_context(self, search_results: List[SearchResult]) -> str:
+        """Формирование контекста"""
+        if not search_results:
+            return "Релевантная информация не найдена."
+        
+        context_parts = []
+        
+        for i, result in enumerate(search_results, 1):
+            source_info = f"[Источник {i} | Релевантность: {result.score:.0%}]"
+            if result.filename:
+                source_info += f"\nДокумент: {result.filename}"
+            if result.chapter:
+                source_info += f"\n{result.chapter}"
+            if result.paragraph:
+                source_info += f"\n{result.paragraph}"
+            if result.points:
+                source_info += f"\nПункты: {', '.join(result.points)}"
+            
+            context_parts.append(f"{source_info}\n\n{result.content}")
+        
+        return "\n\n" + "="*50 + "\n\n".join(context_parts)
+    
+    def _build_prompt(self, query: str, context: str, expanded_queries: List[str]) -> str:
+        """Формирование промпта"""
+        
+        # Показываем какие запросы использовались
+        queries_info = ""
+        if len(expanded_queries) > 1:
+            queries_info = f"""
+Для поиска информации использовались следующие варианты запроса:
+{chr(10).join(f'- {q}' for q in expanded_queries)}
+"""
+        
+        return f"""Ты — эксперт-консультант по нормативно-правовым актам Республики Казахстан.
+Твоя задача — давать точные, полные и практически полезные ответы.
+
+ПРАВИЛА ОТВЕТА:
+1. Отвечай СТРОГО на основе предоставленного контекста
+2. Структурируй ответ: краткий ответ → детали → пошаговые действия (если применимо)
+3. ОБЯЗАТЕЛЬНО указывай номера пунктов при цитировании (например: "согласно п. 23...")
+4. Если информации недостаточно — честно скажи об этом
+5. Используй понятный язык, но сохраняй юридическую точность
+{queries_info}
+КОНТЕКСТ ИЗ ДОКУМЕНТОВ:
 {context}
 
-Вопрос: {question}
+ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
 
-Инструкции:
-1. Ответь строго на основе предоставленных документов
-2. Если информации в документах недостаточно, скажи об этом
-3. Будь точным и конкретным
-4. Не придумывай информацию, которой нет в документах
-
-Ответ:"""
-        
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",  # Можно заменить на gpt-4 если нужно
-                messages=[
-                    {"role": "system", "content": "Ты полезный ассистент, который отвечает на вопросы на основе документов."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=1000
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            print(f"❌ Ошибка при генерации ответа: {e}")
-            return "Извините, произошла ошибка при генерации ответа."
+Дай структурированный ответ:"""
     
-    def ask(self, question: str, show_sources: bool = True) -> dict:
+    def generate_answer(
+        self, 
+        query: str, 
+        search_results: List[SearchResult],
+        expanded_queries: List[str],
+        temperature: float = 0.3,
+        max_tokens: int = 2000
+    ) -> str:
+        """Генерация ответа"""
+        context = self._build_context(search_results)
+        prompt = self._build_prompt(query, context, expanded_queries)
+        
+        logger.info(f"Генерация ответа через {self.llm_model}")
+        
+        response = self.openai.chat.completions.create(
+            model=self.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        return response.choices[0].message.content
+    
+    def ask(
+        self, 
+        query: str, 
+        num_chunks: int = 5,
+        score_threshold: float = 0.3,
+        temperature: float = 0.3,
+        expand_query: bool = True,
+        num_variants: int = 3
+    ) -> RAGResponse:
         """
-        Основной метод для получения ответа на вопрос
+        Основной метод с Query Expansion
         
-        Возвращает:
-        {
-            "answer": "текст ответа",
-            "sources": [список источников],
-            "documents_found": количество найденных документов
-        }
+        Args:
+            query: Вопрос пользователя
+            num_chunks: Количество чанков контекста
+            score_threshold: Минимальный порог релевантности
+            temperature: Температура генерации
+            expand_query: Использовать ли расширение запроса
+            num_variants: Количество вариантов запроса
         """
-        print(f"\n{'='*60}")
-        print(f"🤔 Вопрос: {question}")
-        
-        # 1. Поиск документов
-        print("🔍 Ищу релевантные документы...")
-        documents = self.search_documents(question, limit=3)
-        
-        if not documents:
-            return {
-                "answer": "В моей базе знаний нет информации по этому вопросу.",
-                "sources": [],
-                "documents_found": 0
-            }
-        
-        print(f"✅ Найдено {len(documents)} документов")
+        # 1. Поиск с расширением
+        search_results, expanded_queries = self.search_with_expansion(
+            query=query,
+            limit=num_chunks,
+            score_threshold=score_threshold,
+            expand=expand_query,
+            num_variants=num_variants
+        )
         
         # 2. Генерация ответа
-        print("🤖 Генерирую ответ...")
-        answer = self.generate_answer(question, documents)
-        
-        # 3. Подготовка информации об источниках
-        sources = []
-        if show_sources:
-            for doc in documents:
-                source_info = {
-                    "id": doc["id"],
-                    "relevance": round(doc["score"], 3),
-                    "preview": doc["content"][:150] + "..." if len(doc["content"]) > 150 else doc["content"],
-                    "metadata": doc["metadata"]
-                }
-                sources.append(source_info)
-        
-        return {
-            "answer": answer,
-            "sources": sources,
-            "documents_found": len(documents)
-        }
-    
-    def test_connection(self) -> bool:
-        """
-        Тестирование подключения ко всем сервисам
-        """
-        print("🧪 Тестирование подключений...")
-        
-        try:
-            # Тест OpenAI
-            models = self.openai_client.models.list()
-            print(f"✓ OpenAI: OK (доступно моделей: {len(list(models))})")
-            
-            # Тест Qdrant
-            collections = self.qdrant_client.get_collections()
-            print(f"✓ Qdrant: OK (коллекций: {len(collections.collections)})")
-            
-            # Проверка коллекции
-            if self.collection_name in [c.name for c in collections.collections]:
-                collection_info = self.qdrant_client.get_collection(self.collection_name)
-                print(f"✓ Коллекция '{self.collection_name}': OK (точек: {collection_info.points_count})")
-            else:
-                print(f"⚠️  Коллекция '{self.collection_name}' не найдена")
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Ошибка тестирования: {e}")
-            return False
-
-
-def print_env_info():
-    """
-    Вывод информации о переменных окружения
-    """
-    print("📋 Информация о переменных окружения:")
-    print("-" * 50)
-    
-    env_vars = {
-        "QDRANT_CLOUD_URL": os.getenv("QDRANT_URL"),
-        "QDRANT_API_KEY": os.getenv("QDRANT_API_KEY"),
-        "GPT_KEY": os.getenv("GPT_KEY"),
-        "COLLECTION_NAME": 'my_documents',
-    }
-    
-    for name, value in env_vars.items():
-        if value:
-            # Маскируем длинные ключи для безопасности
-            if "KEY" in name:
-                masked = value[:8] + "..." + value[-4:] if len(value) > 12 else "***"
-                print(f"  {name}: {masked}")
-            else:
-                print(f"  {name}: {value}")
+        if search_results:
+            answer = self.generate_answer(
+                query=query,
+                search_results=search_results,
+                expanded_queries=expanded_queries,
+                temperature=temperature
+            )
         else:
-            print(f"  {name}: ❌ НЕ ЗАДАНА")
+            answer = "К сожалению, я не нашёл релевантной информации в документах. Попробуйте переформулировать вопрос."
+        
+        return RAGResponse(
+            answer=answer,
+            sources=search_results,
+            query=query,
+            expanded_queries=expanded_queries
+        )
+
+
+def compare_modes():
+    """
+    Сравнение режимов: с Query Expansion и без
+    """
+    print("=" * 70)
+    print("🔬 СРАВНЕНИЕ: Query Expansion vs Обычный поиск")
+    print("=" * 70)
     
+    rag = RAGServiceV2()
+    
+    test_query = "Как получить субсидии?"
+    
+    # Без расширения
+    print("\n📌 БЕЗ Query Expansion:")
     print("-" * 50)
+    results_no_expand, queries_no = rag.search_with_expansion(
+        test_query, limit=5, expand=False
+    )
+    print(f"Запросы: {queries_no}")
+    for i, r in enumerate(results_no_expand, 1):
+        print(f"  {i}. Score: {r.score:.3f} | {r.paragraph[:50]}...")
+    
+    # С расширением
+    print("\n📌 С Query Expansion:")
+    print("-" * 50)
+    results_expand, queries_yes = rag.search_with_expansion(
+        test_query, limit=5, expand=True, num_variants=3
+    )
+    print(f"Запросы: {queries_yes}")
+    for i, r in enumerate(results_expand, 1):
+        print(f"  {i}. Score: {r.score:.3f} | {r.paragraph[:50]}...")
+    
+    # Сравнение
+    print("\n" + "=" * 70)
+    print("📊 ИТОГ:")
+    
+    best_no = results_no_expand[0].score if results_no_expand else 0
+    best_yes = results_expand[0].score if results_expand else 0
+    
+    print(f"  Лучший score без расширения: {best_no:.3f}")
+    print(f"  Лучший score с расширением:  {best_yes:.3f}")
+    print(f"  Улучшение: +{(best_yes - best_no):.3f} ({((best_yes/best_no - 1) * 100):.1f}%)")
 
 
 def interactive_mode():
-    """
-    Интерактивный режим работы с системой
-    """
-    print("\n" + "="*60)
-    print("🚀 RAG Система")
-    print("="*60)
-    
-    # Показываем информацию о переменных окружения
-    print_env_info()
-    
-    try:
-        # Инициализация системы
-        rag = RAGSystem()
-        
-        # Тестируем подключение
-        if not rag.test_connection():
-            print("❌ Проблемы с подключением. Проверьте настройки.")
-            return
-        
-        print("\n✅ Система готова к работе!")
-        print("Команды:")
-        print("  - Просто задавайте вопросы")
-        print("  - 'тест' - проверить подключение")
-        print("  - 'источники' - вкл/выкл показ источников")
-        print("  - 'выход' или 'quit' - завершить работу")
-        print("-" * 60)
-        
-        show_sources = True
-        
-        while True:
-            try:
-                # Получаем вопрос
-                user_input = input("\n🧑 Ваш вопрос: ").strip()
-                
-                # Обработка команд
-                if user_input.lower() in ['выход', 'exit', 'quit', 'q']:
-                    print("👋 До свидания!")
-                    break
-                
-                if user_input.lower() == 'тест':
-                    rag.test_connection()
-                    continue
-                
-                if user_input.lower() == 'источники':
-                    show_sources = not show_sources
-                    status = "ВКЛЮЧЕН" if show_sources else "ВЫКЛЮЧЕН"
-                    print(f"📚 Показ источников: {status}")
-                    continue
-                
-                if not user_input:
-                    continue
-                
-                # Получаем ответ
-                result = rag.ask(user_input, show_sources=show_sources)
-                
-                # Выводим результат
-                print(f"\n{'='*60}")
-                print("🤖 Ответ:")
-                print(result["answer"])
-                
-                # Показываем источники если нужно
-                if show_sources and result["sources"]:
-                    print(f"\n📚 Источники ({result['documents_found']} шт):")
-                    for i, source in enumerate(result["sources"], 1):
-                        print(f"\n{i}. ID: {source['id']}")
-                        print(f"   Релевантность: {source['relevance']}")
-                        if source['metadata']:
-                            print(f"   Метаданные: {source['metadata']}")
-                        print(f"   Фрагмент: {source['preview']}")
-                
-                print("=" * 60)
-                
-            except KeyboardInterrupt:
-                print("\n\n👋 Завершение работы...")
-                break
-            except Exception as e:
-                print(f"\n❌ Ошибка: {e}")
-    
-    except EnvironmentError as e:
-        print(f"\n{e}")
-        print("\n💡 Совет: Установите переменные окружения:")
-        print("""
-  # Linux/Mac:
-  export QDRANT_CLOUD_URL='ваш_url_из_qdrant_cloud'
-  export QDRANT_API_KEY='ваш_api_key_из_qdrant'
-  export GPT_KEY='sk-ваш_ключ_openai'
-  export COLLECTION_NAME='documents'  # опционально
-
-  # Windows PowerShell:
-  $env:QDRANT_CLOUD_URL='ваш_url_из_qdrant_cloud'
-  $env:QDRANT_API_KEY='ваш_api_key_из_qdrant'
-  $env:GPT_KEY='sk-ваш_ключ_openai'
-  $env:COLLECTION_NAME='documents'  # опционально
-        """)
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
-
-
-def quick_test_mode():
-    """
-    Режим быстрого тестирования
-    """
-    print("🧪 Быстрый тест системы...")
+    """Интерактивный режим"""
+    print("=" * 60)
+    print("🤖 RAG Консультант v2 (с Query Expansion)")
+    print("=" * 60)
+    print("Команды:")
+    print("  'exit'    — выход")
+    print("  'sources' — показать источники")
+    print("  'simple'  — режим без Query Expansion")
+    print("  'expand'  — режим с Query Expansion (по умолчанию)")
+    print("  'compare' — сравнить режимы")
+    print("-" * 60)
     
     try:
-        rag = RAGSystem()
-        
-        # Тестовые вопросы
-        test_questions = [
-            "Какая основная тема документов?",
-            "Что содержится в документах?",
-            "Расскажи кратко о содержании",
-        ]
-        
-        for question in test_questions:
-            print(f"\n📝 Тестовый вопрос: {question}")
-            result = rag.ask(question, show_sources=False)
-            print(f"📤 Ответ: {result['answer'][:200]}...")
-            print(f"📄 Найдено документов: {result['documents_found']}")
-            print("-" * 60)
-    
+        rag = RAGServiceV2()
+        print("✅ Сервис запущен\n")
     except Exception as e:
-        print(f"❌ Ошибка тестирования: {e}")
+        print(f"❌ Ошибка: {e}")
+        return
+    
+    last_response = None
+    use_expansion = True
+    
+    while True:
+        mode_indicator = "🔄" if use_expansion else "📝"
+        query = input(f"\n{mode_indicator} Ваш вопрос: ").strip()
+        
+        if not query:
+            continue
+        
+        if query.lower() in ['exit', 'quit', 'выход']:
+            print("До свидания!")
+            break
+        
+        if query.lower() == 'simple':
+            use_expansion = False
+            print("✅ Режим: простой поиск (без Query Expansion)")
+            continue
+        
+        if query.lower() == 'expand':
+            use_expansion = True
+            print("✅ Режим: с Query Expansion")
+            continue
+        
+        if query.lower() == 'compare':
+            compare_modes()
+            continue
+        
+        if query.lower() == 'sources' and last_response:
+            print("\n📚 Источники:")
+            for i, source in enumerate(last_response.sources, 1):
+                print(f"\n[{i}] Score: {source.score:.3f}")
+                print(f"    {source.chapter}")
+                print(f"    {source.paragraph}")
+                print(f"    Пункты: {source.points}")
+            
+            if last_response.expanded_queries:
+                print("\n🔄 Использованные запросы:")
+                for q in last_response.expanded_queries:
+                    print(f"    • {q}")
+            continue
+        
+        print("\n⏳ Обрабатываю запрос...")
+        
+        try:
+            response = rag.ask(
+                query, 
+                expand_query=use_expansion,
+                num_variants=3
+            )
+            last_response = response
+            
+            print(f"\n💡 Ответ:\n")
+            print(response.answer)
+            
+            print(f"\n📎 Источников: {len(response.sources)} | ", end="")
+            print(f"Запросов: {len(response.expanded_queries)}")
+            print("   (введите 'sources' для деталей)")
+                
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
 
 
 if __name__ == "__main__":
-    # Проверяем аргументы командной строки
-    if len(sys.argv) > 1:
-        command = sys.argv[1].lower()
-        
-        if command == "test":
-            quick_test_mode()
-        elif command == "env":
-            print_env_info()
-        elif command == "help":
-            print("""
-Использование:
-  python rag_system.py           # Интерактивный режим (по умолчанию)
-  python rag_system.py test     # Быстрый тест
-  python rag_system.py env      # Показать переменные окружения
-  python rag_system.py help     # Эта справка
-  
-Переменные окружения (ОБЯЗАТЕЛЬНЫ):
-  QDRANT_CLOUD_URL    - URL вашего Qdrant Cloud кластера
-  QDRANT_API_KEY      - API ключ Qdrant
-  GPT_KEY             - API ключ OpenAI
-  
-Переменные окружения (опционально):
-  COLLECTION_NAME     - Название коллекции (по умолчанию: 'documents')
-            """)
-        else:
-            print(f"❌ Неизвестная команда: {command}")
-            print("Используйте: python rag_system.py [test|env|help]")
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        compare_modes()
     else:
-        # Запуск в интерактивном режиме по умолчанию
         interactive_mode()
